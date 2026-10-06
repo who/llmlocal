@@ -316,7 +316,9 @@ llama-sandbox-allow --list
 Sandboxed clients then use `http://$(hostname):8080/v1`, not `127.0.0.1` — see the
 `NO_PROXY` note in §5.
 
-### ortus
+### [ortus](https://github.com/who/ortus)
+
+Ortus closes a backlog of bd-tracked issues, one fresh agent subprocess per task.
 
 `ortus grind` drives the local model through opencode. A project `.ortusrc` pins it in a
 `[local]` table, which must stay last in the file since TOML puts every following key
