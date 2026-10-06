@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# llmlocal — boot a llama.cpp server on the 5090 with a model picked from a menu.
+#
+#   llmlocal                          menu; Enter takes the default (last used, else entry 1)
+#   llmlocal 2                        menu entry 2, no prompt
+#   llmlocal unsloth/X-GGUF:Q8_0      any Hugging Face GGUF repo[:quant], listed or not
+#   llmlocal --list                   print the menu with cache status and exit
+#   llmlocal --download [MODEL]       fetch (or re-verify) a model and exit; the server keeps running
+#   llmlocal --dry-run [MODEL]        print the download/serve commands instead of running them
+#   llmlocal 2 --port 9931            anything else passes straight to `llama serve` and wins;
+#                                     put the model before pass-through flags
+#
+# A model missing from `llama serve --cache-list` is fetched with `llama download` BEFORE
+# the previous server is stopped, so it keeps answering during the download. The cache
+# names each GGUF blob by its sha256, so a fresh download is hashed and a mismatch deletes
+# it and retries once (a torn resume once produced a 20 GB blob that answered "////").
+# `--download` re-hashes every cached GGUF of that repo, so it doubles as a repair tool.
+# GET /v1/models reports the repo:quant string as the model id, as the old heretic script
+# did, so .ortusrc / opencode.json pin that string.
+#
+# Menu entries: MODELS below, plus one `repo[:quant] [extra llama serve flags]` per line
+# in ~/.config/llmlocal/models (override the path with LLMLOCAL_MODELS). Lines starting
+# with # are ignored; extra flags split on whitespace, no quoting.
+#
+# Context: 128K (raised from 64K on 2026-09-02 so codex/ortus grind runs stop overflowing;
+# Qwen3.8-27B trained at 262K) with a q8_0 KV cache. Do not raise -c further without
+# checking headroom: sysmem fallback degrades silently (56 t/s -> 0.24). Measured
+# 2026-09-02 on the heretic Q4_K_M at 128K: 28.0 GB of 32.6 GB used with ~5.5 GB taken
+# by other apps, 58 t/s generation. Check with:
+#   nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+#
+# Bind address and port come from LLAMA_ARG_HOST / LLAMA_ARG_PORT (llama serve reads the
+# same variables), defaulting to 0.0.0.0:8080 so Claude Code sandboxes can reach the
+# server at http://$(hostname):8080 — their proxy relays to this host, but their NO_PROXY
+# makes clients skip the proxy for 127.0.0.1. Explicit --host/--port flags win.
+set -u
+
+MODELS=(
+  "unsloth/Qwen3.8-27B-GGUF:Q4_K_M"
+  "0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+)
+SERVE_FLAGS=(--jinja -c 131072 -fa on --cache-type-k q8_0 --cache-type-v q8_0)
+
+config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/llmlocal
+models_file=${LLMLOCAL_MODELS:-$config_dir/models}
+last_file=$config_dir/last
+
+export LLAMA_ARG_HOST="${LLAMA_ARG_HOST:-0.0.0.0}"
+export LLAMA_ARG_PORT="${LLAMA_ARG_PORT:-8080}"
+
+die() { echo "llmlocal: $*" >&2; exit 1; }
+usage() { sed -n '2,/^set -u$/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+
+# ---- arguments ---------------------------------------------------------------
+mode=serve sel="" dry=0
+pass=()
+while (($#)); do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    --list) mode=list ;;
+    --download) mode=download ;;
+    --dry-run) dry=1 ;;
+    --) shift; pass+=("$@"); break ;;
+    -*) pass+=("$1") ;;
+    *) if [[ -z $sel && ${#pass[@]} -eq 0 ]]; then sel=$1; else pass+=("$1"); fi ;;
+  esac
+  shift
+done
+
+# Explicit --host/--port flags override the variables; track them so the
+# port-freeing step and the banner match what llama serve will actually use.
+HOST=$LLAMA_ARG_HOST PORT=$LLAMA_ARG_PORT
+for ((i = 0; i < ${#pass[@]}; i++)); do
+  case ${pass[i]} in
+    --host) HOST=${pass[i + 1]-} ;;
+    --port) PORT=${pass[i + 1]-} ;;
+    --host=*) HOST=${pass[i]#*=} ;;
+    --port=*) PORT=${pass[i]#*=} ;;
+  esac
+done
+
+# ---- model list --------------------------------------------------------------
+specs=() extras=()
+add_entry() {  # "repo[:quant] [extra llama serve flags]"
+  local spec=${1%%[[:space:]]*} rest=${1#"${1%%[[:space:]]*}"}
+  specs+=("$spec"); extras+=("${rest#"${rest%%[![:space:]]*}"}")
+}
+for m in "${MODELS[@]}"; do add_entry "$m"; done
+if [[ -r $models_file ]]; then
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%%#*}
+    line=${line#"${line%%[![:space:]]*}"}; line=${line%"${line##*[![:space:]]}"}
+    [[ -n $line ]] && add_entry "$line"
+  done < "$models_file"
+fi
+
+cached=$(llama serve --cache-list 2>&1 | sed -nE 's/^ *[0-9]+\. +//p')
+is_cached() {  # repo[:quant]; a bare repo means llama's default quant
+  local s=${1,,}
+  if [[ $s == *:* ]]; then
+    grep -qFx -e "$s" <<<"${cached,,}"
+  else
+    grep -qFx -e "$s:q4_k_m" -e "$s:latest" -e "$s" <<<"${cached,,}"
+  fi
+}
+
+hf_size() {  # repo[:quant] -> "16.5 GB" (gguf + mmproj) when the HF manifest is reachable
+  local repo=${1%%:*} tag=latest
+  [[ $1 == *:* ]] && tag=${1#*:}
+  command -v python3 >/dev/null 2>&1 || return 0
+  curl -fsS --max-time 4 -H 'User-Agent: llama-cpp' \
+    "https://huggingface.co/v2/$repo/manifests/$tag" 2>/dev/null |
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    n = d["ggufFile"]["size"] + (d.get("mmprojFile") or {}).get("size", 0)
+    print(f"{n / 1e9:.1f} GB")
+except Exception:
+    pass' 2>/dev/null
+}
+
+default=1
+if [[ -r $last_file ]]; then
+  IFS= read -r last < "$last_file"
+  for i in "${!specs[@]}"; do [[ ${specs[i]} == "$last" ]] && default=$((i + 1)); done
+fi
+
+print_menu() {  # $1 = fd to print on
+  local i state size
+  for i in "${!specs[@]}"; do
+    if is_cached "${specs[i]}"; then
+      state=cached
+    else
+      size=$(hf_size "${specs[i]}"); state="download${size:+ $size}"
+    fi
+    printf '%3d) %-68s [%s]%s\n' "$((i + 1))" "${specs[i]}" "$state" \
+      "$([[ $((i + 1)) -eq $default ]] && printf '  (default)')" >&"$1"
+  done
+}
+
+if [[ $mode == list ]]; then
+  echo "llmlocal models (Enter = $default). Add entries in $models_file"
+  print_menu 1
+  exit 0
+fi
+
+# ---- pick --------------------------------------------------------------------
+extra=""
+if [[ -n $sel ]]; then
+  if [[ $sel =~ ^[0-9]+$ ]]; then
+    ((10#$sel >= 1 && 10#$sel <= ${#specs[@]})) || die "no menu entry $sel (1-${#specs[@]}); see llmlocal --list"
+    extra=${extras[10#$sel - 1]}; sel=${specs[10#$sel - 1]}
+  elif [[ $sel == */* ]]; then
+    for i in "${!specs[@]}"; do [[ ${specs[i]} == "$sel" ]] && extra=${extras[i]}; done
+  else
+    die "'$sel' is neither a menu number nor a Hugging Face repo[:quant]"
+  fi
+else
+  echo "llmlocal: pick a model (Enter = $default, q = quit, or type any Hugging Face repo[:quant])" >&2
+  print_menu 2
+  while :; do
+    printf 'Model [%s]: ' "$default" >&2
+    IFS= read -r reply || { reply=""; echo >&2; }   # EOF (no tty) takes the default
+    reply=${reply//[[:space:]]/}
+    case $reply in
+      "") reply=$default ;;
+      q|quit|exit) exit 0 ;;
+    esac
+    if [[ $reply =~ ^[0-9]+$ ]] && ((10#$reply >= 1 && 10#$reply <= ${#specs[@]})); then
+      extra=${extras[10#$reply - 1]}; sel=${specs[10#$reply - 1]}; break
+    elif [[ $reply == */* ]]; then
+      sel=$reply; break
+    fi
+    echo "llmlocal: enter 1-${#specs[@]}, a Hugging Face repo[:quant], or q" >&2
+  done
+fi
+
+# ---- download if missing -----------------------------------------------------
+run() { if ((dry)); then printf '+'; printf ' %q' "$@"; echo; else "$@"; fi; }
+
+hub=${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}
+verify_repo() {  # repo since-epoch: hash the repo's linked GGUF blobs modified at/after since
+  local dir=$hub/models--${1//\//--} link blob want got bad=0
+  [[ -d $dir/snapshots ]] || { echo "llmlocal: no cache dir $dir; skipping the hash check" >&2; return 0; }
+  for link in "$dir"/snapshots/*/*.gguf; do
+    [[ -e $link ]] || continue
+    blob=$(readlink -f "$link"); want=$(basename "$blob")
+    [[ $want =~ ^[0-9a-f]{64}$ ]] || continue
+    (( $(stat -c %Y "$blob") >= $2 )) || continue
+    echo "llmlocal: hashing $(basename "$link") ($(( $(stat -c %s "$blob") / 1000000 )) MB)" >&2
+    got=$(sha256sum "$blob" | cut -c1-64)
+    if [[ $got == "$want" ]]; then
+      echo "llmlocal: sha256 OK" >&2
+    else
+      echo "llmlocal: sha256 MISMATCH for $link (got $got); deleting it" >&2
+      rm -f "$blob" "$link"; bad=1
+    fi
+  done
+  return $bad
+}
+
+fetch() {  # repo[:quant] since-epoch: llama download, then verify; one retry on a bad hash
+  local attempt
+  for attempt in 1 2; do
+    run llama download -hf "$1" || return 1
+    ((dry)) && return 0
+    verify_repo "${1%%:*}" "$2" && return 0
+    [[ $attempt == 1 ]] && echo "llmlocal: retrying the download" >&2
+  done
+  return 1
+}
+
+if [[ $mode == download ]]; then
+  echo "llmlocal: fetching $sel and hashing its cached GGUFs (any running server is left alone)" >&2
+  fetch "$sel" 0 || die "download or hash check failed; nothing was stopped"
+  exit 0
+elif is_cached "$sel"; then
+  echo "llmlocal: $sel is in the llama cache" >&2
+else
+  echo "llmlocal: $sel is not cached; downloading first (any running server is left alone)" >&2
+  fetch "$sel" "$(date +%s)" || die "download or hash check failed; nothing was stopped"
+fi
+
+# ---- serve -------------------------------------------------------------------
+# shellcheck disable=SC2086  # $extra is intentionally word-split
+set -- llama serve -hf "$sel" --alias "$sel" --offline "${SERVE_FLAGS[@]}" $extra ${pass[@]+"${pass[@]}"}
+if ((dry)); then printf '+'; printf ' %q' "$@"; echo; exit 0; fi
+
+mkdir -p "$config_dir" && printf '%s\n' "$sel" > "$last_file"
+
+# Free the port if a previous server is still holding it.
+pid=$(ss -tlnp "sport = :$PORT" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)
+if [[ -n ${pid:-} ]]; then
+  echo "llmlocal: killing pid $pid ($(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-60)) on port $PORT" >&2
+  kill -9 "$pid"
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+fi
+
+echo "llmlocal: serving $sel on $HOST:$PORT — clients use http://$(hostname):$PORT/v1 with model \"$sel\"" >&2
+exec "$@"
